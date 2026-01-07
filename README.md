@@ -1,6 +1,12 @@
 # onlydiff
 
-Wraps formatters to only format lines you actually changed, keeping untouched code unformatted.
+_"The dream of PR reviewers everywhere"_
+
+— Vogue
+
+## Elevator pitch
+
+Stop creating massive formatting diffs. Format only the lines you actually changed, keep your diffs clean, and your code reviewers happy.
 
 ## Usage
 
