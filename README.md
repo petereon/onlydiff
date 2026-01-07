@@ -2,7 +2,7 @@
 
 _"The dream of PR reviewers everywhere"_
 
-— Vogue
+— PR reviewers everywhere
 
 ## Elevator pitch
 
