@@ -1,0 +1,109 @@
+#!/usr/bin/env bb
+
+(require '[clojure.string :as str]
+         '[clojure.java.shell :refer [sh]])
+
+;; --- Diff Parsing & Merging Logic ---
+
+(defn get-changed-lines
+  "Extract the set of OLD line numbers that were changed from a diff"
+  [diff-str]
+  (->> (str/split-lines diff-str)
+       (filter #(str/starts-with? % "@@"))
+       (mapcat (fn [line]
+                 (let [[_ old-range _] (str/split line #" ")
+                       ;; old-range is like "-1,2" or "-1"
+                       clean-range (subs old-range 1)
+                       parts (str/split clean-range #",")
+                       start (Integer/parseInt (first parts))
+                       len (if (> (count parts) 1)
+                             (Integer/parseInt (second parts))
+                             1)]
+                   ;; Return all OLD line numbers in this range
+                   (range start (+ start len)))))
+       (set)))
+
+(defn hunk-modifies-lines?
+  "Check if a hunk modifies any of the given OLD line numbers"
+  [hunk user-lines]
+  (let [hunk-lines (str/split-lines hunk)
+        ;; Extract the OLD line range from the @@ header
+        header (first hunk-lines)
+        [_ old-range _] (str/split header #" ")
+        ;; old-range is like "-1,2" or "-1"
+        clean-range (subs old-range 1)
+        parts (str/split clean-range #",")
+        start (Integer/parseInt (first parts))
+        len (if (> (count parts) 1)
+              (Integer/parseInt (second parts))
+              1)
+        ;; Get all OLD line numbers this hunk touches
+        hunk-line-set (set (range start (+ start len)))]
+    ;; Check if any user-changed line is in this hunk's OLD range
+    (some user-lines hunk-line-set)))
+
+(defn filter-diff [pre-diff-str post-diff-str]
+  (let [user-changed-lines (get-changed-lines pre-diff-str)
+        ;; Split by lookahead for @@ at start of line
+        ;; The first element is usually the header (diff --git ...)
+        after-hunks (str/split post-diff-str #"(?m)(?=^@@)")]
+    (with-out-str
+      (doseq [hunk after-hunks]
+        (if (str/starts-with? hunk "@@")
+          ;; Only keep the hunk if it modifies lines that the user changed
+          (when (hunk-modifies-lines? hunk user-changed-lines)
+            (print hunk))
+          ;; Print headers (not starting with @@)
+          (print hunk))))))
+
+;; --- Orchestration Logic ---
+
+(defn git-diff-files []
+  (let [{:keys [exit out]} (sh "git" "diff" "--name-only")]
+    (if (zero? exit)
+      (str/split-lines out)
+      [])))
+
+(defn git-diff-content [file]
+  (:out (sh "git" "diff" "-U0" "--" file)))
+
+(defn run-command [args]
+  (println "Running:" (str/join " " args))
+  (let [result (apply sh args)]
+    (when (and (not (zero? (:exit result)))
+               (not (str/blank? (:err result))))
+      (println "Error from command:" (:err result)))
+    result))
+
+(defn -main [& args]
+  (when (empty? args)
+    (println "Usage: onlydiff <command> [args...]")
+    (System/exit 1))
+
+  ;; 1. Capture intent: pre-transform diffs
+  (let [files (git-diff-files)
+        pre-diffs (reduce (fn [acc f] 
+                            (assoc acc f (git-diff-content f))) 
+                          {} 
+                          files)]
+    
+    ;; 2. Run the command verbatim
+    (run-command args)
+    
+    ;; 3. Process each modified file
+    (doseq [f files]
+      (let [post-diff (git-diff-content f)]
+        (when-not (str/blank? post-diff)
+          (let [pre-diff (get pre-diffs f)
+                filtered-patch (filter-diff pre-diff post-diff)]
+            
+            ;; 4. Reset file and apply filtered patch
+            ;; Always reset to index to clear unrelated changes
+            (sh "git" "checkout" "--" f)
+            
+            ;; Apply patch if it exists
+            (when-not (str/blank? filtered-patch)
+              (sh "git" "apply" "--unidiff-zero" "--whitespace=nowarn" "-" 
+                  :in filtered-patch))))))))
+
+(apply -main *command-line-args*)
