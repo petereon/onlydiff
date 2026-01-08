@@ -1,109 +1,159 @@
 #!/usr/bin/env bb
 
-(require '[clojure.string :as str]
-         '[clojure.java.shell :refer [sh]])
+(require '[clojure.java.shell :refer [sh]]
+         '[clojure.string :as str]
+         '[clojure.java.io :as io]
+         '[clojure.set :as set])
 
-;; --- Diff Parsing & Merging Logic ---
+;; --- 1. Git Helpers ---
 
-(defn get-changed-lines
-  "Extract the set of OLD line numbers that were changed from a diff"
-  [diff-str]
-  (->> (str/split-lines diff-str)
-       (filter #(str/starts-with? % "@@"))
-       (mapcat (fn [line]
-                 (let [[_ old-range _] (str/split line #" ")
-                       ;; old-range is like "-1,2" or "-1"
-                       clean-range (subs old-range 1)
-                       parts (str/split clean-range #",")
-                       start (Integer/parseInt (first parts))
-                       len (if (> (count parts) 1)
-                             (Integer/parseInt (second parts))
-                             1)]
-                   ;; Return all OLD line numbers in this range
-                   (range start (+ start len)))))
-       (set)))
-
-(defn hunk-modifies-lines?
-  "Check if a hunk modifies any of the given OLD line numbers"
-  [hunk user-lines]
-  (let [hunk-lines (str/split-lines hunk)
-        ;; Extract the OLD line range from the @@ header
-        header (first hunk-lines)
-        [_ old-range _] (str/split header #" ")
-        ;; old-range is like "-1,2" or "-1"
-        clean-range (subs old-range 1)
-        parts (str/split clean-range #",")
-        start (Integer/parseInt (first parts))
-        len (if (> (count parts) 1)
-              (Integer/parseInt (second parts))
-              1)
-        ;; Get all OLD line numbers this hunk touches
-        hunk-line-set (set (range start (+ start len)))]
-    ;; Check if any user-changed line is in this hunk's OLD range
-    (some user-lines hunk-line-set)))
-
-(defn filter-diff [pre-diff-str post-diff-str]
-  (let [user-changed-lines (get-changed-lines pre-diff-str)
-        ;; Split by lookahead for @@ at start of line
-        ;; The first element is usually the header (diff --git ...)
-        after-hunks (str/split post-diff-str #"(?m)(?=^@@)")]
-    (with-out-str
-      (doseq [hunk after-hunks]
-        (if (str/starts-with? hunk "@@")
-          ;; Only keep the hunk if it modifies lines that the user changed
-          (when (hunk-modifies-lines? hunk user-changed-lines)
-            (print hunk))
-          ;; Print headers (not starting with @@)
-          (print hunk))))))
-
-;; --- Orchestration Logic ---
-
-(defn git-diff-files []
-  (let [{:keys [exit out]} (sh "git" "diff" "--name-only")]
+(defn get-changed-files []
+  (let [{:keys [exit out]} (sh "git" "diff" "--name-only" "HEAD")]
     (if (zero? exit)
       (str/split-lines out)
-      [])))
+      (do (println "Error getting git diff:" out) []))))
 
-(defn git-diff-content [file]
-  (:out (sh "git" "diff" "-U0" "--" file)))
+(defn parse-diff-ranges [diff-out]
+  ;; Parses @@ -old,cnt +new,cnt @@
+  ;; We care about the +new,cnt part which represents lines in the User State.
+  (let [regex #"@@ \-\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@"]
+    (->> (re-seq regex diff-out)
+         (mapcat (fn [[_ start count]]
+                   (let [s (Integer/parseInt start)
+                         c (if count (Integer/parseInt count) 1)
+                         ;; If count is 0 (deletion), we still track the line 's' as a "touch point"
+                         ;; to allow reformatting around the deletion.
+                         end (+ s (max 1 c) -1)]
+                     (range s (inc end)))))
+         (set))))
 
-(defn run-command [args]
-  (println "Running:" (str/join " " args))
-  (let [result (apply sh args)]
-    (when (and (not (zero? (:exit result)))
-               (not (str/blank? (:err result))))
-      (println "Error from command:" (:err result)))
-    result))
+(defn get-user-touched-lines [file]
+  (let [{:keys [exit out]} (sh "git" "diff" "-U0" "HEAD" "--" file)]
+    (if (zero? exit)
+      (parse-diff-ranges out)
+      #{})))
+
+;; --- 2. Patching Logic ---
+
+(defn generate-patch-hunks [original-content new-content]
+  (let [f1 (java.io.File/createTempFile "old" ".tmp")
+        f2 (java.io.File/createTempFile "new" ".tmp")]
+    (spit f1 original-content)
+    (spit f2 new-content)
+    ;; -U0 is crucial for tight localized patches
+    (let [{:keys [out]} (sh "diff" "-U0" (.getAbsolutePath f1) (.getAbsolutePath f2))]
+      (.delete f1)
+      (.delete f2)
+      out)))
+
+(defn parse-and-apply-hunks [original-lines patch-output allowed-lines]
+  (let [diff-lines (str/split-lines patch-output)
+        header-regex #"^@@ \-(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@.*"]
+
+    ;; 1. Parse Hunks
+    (let [hunks (loop [lines diff-lines
+                       current-hunk nil
+                       acc []]
+                  (if (empty? lines)
+                    (if current-hunk (conj acc current-hunk) acc)
+                    (let [line (first lines)]
+                      (if (re-find #"^@@ " line) ;; Start of new hunk
+                        (let [matcher (re-find header-regex line)]
+                          (if matcher
+                            (let [[_ start-str cnt-str _ _] matcher
+                                  start (Integer/parseInt start-str)
+                                  cnt (if cnt-str (Integer/parseInt cnt-str) 1)
+                                  range (if (zero? cnt)
+                                          #{start} ;; Check intersection with the insertion point
+                                          (set (range start (+ start cnt))))]
+                              (if current-hunk
+                                (recur (rest lines) {:start start :len cnt :range range :content []} (conj acc current-hunk))
+                                (recur (rest lines) {:start start :len cnt :range range :content []} acc)))
+                            (recur (rest lines) current-hunk acc)))
+                        (if current-hunk
+                          (recur (rest lines) (update current-hunk :content conj line) acc)
+                          (recur (rest lines) current-hunk acc))))))]
+
+      ;; 2. Filter and Construct Replacements
+      (let [replacements (keep (fn [{:keys [start len range content]}]
+                                 (if (not-empty (set/intersection range allowed-lines))
+                                   (let [added-lines (->> content
+                                                          (filter #(str/starts-with? % "+"))
+                                                          (map #(subs % 1)))]
+                                     {:start start
+                                      :len len
+                                      :lines added-lines})
+                                   nil))
+                               hunks)
+            ;; Sort reverse to prevent index shifting
+            sorted-replacements (sort-by :start > replacements)
+            original-vec (vec original-lines)]
+
+        ;; 3. Apply Patch
+        (reduce (fn [acc {:keys [start len lines]}]
+                  (let [idx (if (zero? len)
+                              start       ;; Insertion: Index is `start` (insert after line `start` in 0-based terms roughly)
+                              (dec start)) ;; Modification: Index is `start - 1`
+
+                        ;; Safety clamps
+                        idx (max 0 (min (count acc) idx))
+
+                        before (subvec acc 0 idx)
+                        after (subvec acc (min (count acc) (+ idx len)))]
+                    (vec (concat before lines after))))
+                original-vec
+                sorted-replacements)))))
+
+;; --- 3. Main Workflow ---
 
 (defn -main [& args]
-  (when (empty? args)
-    (println "Usage: onlydiff <command> [args...]")
-    (System/exit 1))
+  (let [transformer-cmd (str/join " " args)]
+    (if (str/blank? transformer-cmd)
+      (do (println "Usage: partial_fmt.bb \"<transformer command>\"")
+          (System/exit 1))
+      (println "Transformer:" transformer-cmd))
 
-  ;; 1. Capture intent: pre-transform diffs
-  (let [files (git-diff-files)
-        pre-diffs (reduce (fn [acc f] 
-                            (assoc acc f (git-diff-content f))) 
-                          {} 
-                          files)]
-    
-    ;; 2. Run the command verbatim
-    (run-command args)
-    
-    ;; 3. Process each modified file
-    (doseq [f files]
-      (let [post-diff (git-diff-content f)]
-        (when-not (str/blank? post-diff)
-          (let [pre-diff (get pre-diffs f)
-                filtered-patch (filter-diff pre-diff post-diff)]
-            
-            ;; 4. Reset file and apply filtered patch
-            ;; Always reset to index to clear unrelated changes
-            (sh "git" "checkout" "--" f)
-            
-            ;; Apply patch if it exists
-            (when-not (str/blank? filtered-patch)
-              (sh "git" "apply" "--unidiff-zero" "--whitespace=nowarn" "-" 
-                  :in filtered-patch))))))))
+    (let [files (get-changed-files)]
+      (if (empty? files)
+        (println "No changed files detected in git.")
+        (do
+          (println "Detected modified files:" files)
 
-(apply -main *command-line-args*)
+          ;; Snapshot
+          (let [file-snapshots (reduce (fn [acc f]
+                                         (if (.exists (io/file f))
+                                           (assoc acc f {:content (slurp f)
+                                                         :lines (str/split-lines (slurp f))
+                                                         :touched (get-user-touched-lines f)})
+                                           acc))
+                                       {}
+                                       files)]
+
+            ;; Run Transformer
+            (println "Running transformer...")
+            (let [{:keys [exit _ err]} (sh "bash" "-c" transformer-cmd)]
+              (if (not (zero? exit))
+                (println "Transformer warning/error:" err)
+                (println "Transformer finished.")))
+
+            ;; Reconcile
+            (doseq [f files]
+              (when (contains? file-snapshots f)
+                (let [original-content (get-in file-snapshots [f :content])
+                      original-lines (get-in file-snapshots [f :lines])
+                      touched-set (get-in file-snapshots [f :touched])
+                      current-content (slurp f)]
+
+                  (if (= original-content current-content)
+                    (println "No changes by transformer for" f)
+                    (do
+                      (let [patch-out (generate-patch-hunks original-content current-content)]
+                        (if (str/blank? patch-out)
+                          (println "No effective patch for" f)
+                          (do
+                            (let [final-lines (parse-and-apply-hunks original-lines patch-out touched-set)
+                                  final-content (str/join "\n" final-lines)]
+                              (spit f (str final-content "\n"))
+                              (println "Applied partial formatting to" f))))))))))))))))
+
+  (-main (or *command-line-args* []))
