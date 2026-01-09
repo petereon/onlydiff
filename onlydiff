@@ -156,4 +156,4 @@
                               (spit f (str final-content "\n"))
                               (println "Applied partial formatting to" f))))))))))))))))
 
-  (-main (or *command-line-args* []))
+(-main (or *command-line-args* []))
