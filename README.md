@@ -26,6 +26,9 @@ onlydiff gofmt -w .
 3. Filters formatter output to only keep changes overlapping your modifications
 4. Applies the filtered patch
 
+> [!NOTE]
+> The tool defaults to applying the entire hunk from formatter output if any line in that hunk intersects user-modified lines. This might result in some lines you didn't directly touch being changed. While imperfect, it's surefire - using heuristics to select only the lines you directly touched would be error-prone.
+
 <details>
 
 <summary>Details for the curious</summary>
