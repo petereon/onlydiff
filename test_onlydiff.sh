@@ -59,11 +59,11 @@ git commit -m "Initial commit with bad formatting" --quiet
 # ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++ #
 
 
-sed -i '' '6s/def function_two(a,b,c)/def    function_two( a , b , c )/' test.py
+python3 -c 'from pathlib import Path; p = Path("test.py"); p.write_text(p.read_text().replace("def function_two(a,b,c):", "def    function_two( a , b , c ):", 1))'
 
 if ! command -v black &> /dev/null; then
-    echo "Black is not installed. Installing with pip..."
-    pip3 install black
+    echo "Black is not installed. Installing Black 25.9.0 with pip..."
+    python3 -m pip install "black==25.9.0"
 fi
 
 ONLYDIFF="$ORIGINAL_DIR/onlydiff"
