@@ -20,7 +20,7 @@ trap cleanup EXIT
 cd "$TEST_DIR"
 
 # Initialize git repo
-git init --quiet
+git init --quiet -b trunk
 git config user.name "Test User"
 git config user.email "test@example.com"
 
@@ -51,7 +51,7 @@ EOF
 
 # Commit the badly formatted file
 git add test.py >/dev/null 2>&1
-git commit --no-verify -m "Initial commit with bad formatting" --quiet
+git commit -m "Initial commit with bad formatting" --quiet
 
 
 # ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++ #
@@ -104,6 +104,55 @@ else
     echo "✗ FAIL: function_four was formatted (should have been untouched)"
     exit 1
 fi
+
+if "$ONLYDIFF" false >/dev/null 2>&1; then
+    echo "✗ FAIL: transformer failure was not propagated"
+    exit 1
+else
+    echo "✓ PASS: transformer failure was propagated"
+fi
+
+ROOT_DIR="$TEST_DIR/root"
+mkdir "$ROOT_DIR"
+(
+    cd "$ROOT_DIR"
+    git init --quiet -b trunk
+    git config user.name "Test User"
+    git config user.email "test@example.com"
+    printf 'root foo\n' > "root file.txt"
+    python3 -c 'from pathlib import Path; Path("binary.bin").write_bytes(b"\x00\xff")'
+    git add "root file.txt" binary.bin
+    "$ONLYDIFF" --cached --append-files python3 -c \
+        'from pathlib import Path; import sys; [(p := Path(name)).write_text(p.read_text().replace("foo", "bar")) for name in sys.argv[1:]]' \
+        >/dev/null
+    grep -qx 'root bar' "root file.txt"
+    test "$(python3 -c 'from pathlib import Path; print(Path("binary.bin").read_bytes().hex())')" = "00ff"
+)
+echo "✓ PASS: cached mode handled an initial commit, spaces, and automatic binary exclusion"
+
+CACHED_DIR="$TEST_DIR/cached"
+mkdir "$CACHED_DIR"
+(
+    cd "$CACHED_DIR"
+    git init --quiet -b trunk
+    git config user.name "Test User"
+    git config user.email "test@example.com"
+    printf 'untouched foo\nseparator\nchanged foo\n' > "cached file.txt"
+    git add "cached file.txt"
+    git commit -m "Cached baseline" --quiet
+    printf 'untouched foo\nseparator\nchanged foo touched\n' > "cached file.txt"
+    git add "cached file.txt"
+    "$ONLYDIFF" --cached python3 -c \
+        'from pathlib import Path; import sys; p = Path(sys.argv[1]); p.write_text(p.read_text().replace("foo", "bar"))' \
+        "cached file.txt" >/dev/null
+    grep -qx 'untouched foo' "cached file.txt"
+    grep -qx 'changed bar touched' "cached file.txt"
+    if "$ONLYDIFF" --cached --file "cached file.txt" true >/dev/null 2>&1; then
+        echo "✗ FAIL: cached mode accepted a file with unstaged changes"
+        exit 1
+    fi
+)
+echo "✓ PASS: cached mode formatted only the touched hunk and rejected mixed state"
 
 echo ""
 echo "=== ALL TESTS PASSED ==="

@@ -7,11 +7,44 @@
 
 ;; --- 1. Git Helpers ---
 
-(defn get-changed-files []
-  (let [{:keys [exit out]} (sh "git" "diff" "--name-only" "HEAD")]
+(defn head-exists? []
+  (zero? (:exit (sh "git" "rev-parse" "--verify" "HEAD"))))
+
+(defn git-diff [cached? options file]
+  (let [args (concat ["git" "diff"]
+                     (when cached? ["--cached"])
+                     options
+                     (when (head-exists?) ["HEAD"])
+                     (when file ["--" file]))]
+    (apply sh args)))
+
+(defn binary-file? [cached? file]
+  (let [{:keys [exit out]} (git-diff cached? ["--numstat" "--diff-filter=d"] file)
+        columns (str/split (first (str/split-lines out)) #"\t" 3)]
+    (and (zero? exit)
+         (= "-" (first columns))
+         (= "-" (second columns)))))
+
+(defn text-file? [cached? file]
+  (let [path (.toPath (io/file file))]
+    (and (java.nio.file.Files/isRegularFile path (make-array java.nio.file.LinkOption 0))
+         (not (java.nio.file.Files/isSymbolicLink path))
+         (not (binary-file? cached? file)))))
+
+(defn get-changed-files [cached? included-files]
+  (let [{:keys [exit out err]} (git-diff cached? ["--name-only" "-z" "--diff-filter=d"] nil)]
     (if (zero? exit)
-      (str/split-lines out)
-      (do (println "Error getting git diff:" out) []))))
+      (let [files (->> (str/split out #"\u0000")
+                       (remove str/blank?)
+                       (vec))
+            selected-files (if (seq included-files)
+                             (filterv (set included-files) files)
+                             files)
+            skipped-files (filterv #(not (text-file? cached? %)) selected-files)]
+        (doseq [file skipped-files]
+          (println "Skipping non-text file:" file))
+        (filterv (complement (set skipped-files)) selected-files))
+      (do (println "Error getting git diff:" err) []))))
 
 (defn parse-diff-ranges [diff-out]
   ;; Parses @@ -old,cnt +new,cnt @@
@@ -27,8 +60,8 @@
                      (range s (inc end)))))
          (set))))
 
-(defn get-user-touched-lines [file]
-  (let [{:keys [exit out]} (sh "git" "diff" "-U0" "HEAD" "--" file)]
+(defn get-user-touched-lines [cached? file]
+  (let [{:keys [exit out]} (git-diff cached? ["-U0"] file)]
     (if (zero? exit)
       (parse-diff-ranges out)
       #{})))
@@ -106,54 +139,109 @@
 
 ;; --- 3. Main Workflow ---
 
-(defn -main [& args]
-  (let [transformer-cmd (str/join " " args)]
-    (if (str/blank? transformer-cmd)
-      (do (println "Usage: partial_fmt.bb \"<transformer command>\"")
-          (System/exit 1))
-      (println "Transformer:" transformer-cmd))
+(defn reconcile-files [files file-snapshots]
+  (doseq [f files]
+    (when (contains? file-snapshots f)
+      (let [original-content (get-in file-snapshots [f :content])
+            original-lines (get-in file-snapshots [f :lines])
+            touched-set (get-in file-snapshots [f :touched])
+            current-content (slurp f)]
 
-    (let [files (get-changed-files)]
-      (if (empty? files)
-        (println "No changed files detected in git.")
-        (do
-          (println "Detected modified files:" files)
+        (if (= original-content current-content)
+          (println "No changes by transformer for" f)
+          (let [patch-out (generate-patch-hunks original-content current-content)]
+            (if (str/blank? patch-out)
+              (println "No effective patch for" f)
+              (let [final-lines (parse-and-apply-hunks original-lines patch-out touched-set)
+                    final-content (str/join "\n" final-lines)]
+                (spit f (str final-content "\n"))
+                (println "Applied partial formatting to" f)))))))))
 
-          ;; Snapshot
-          (let [file-snapshots (reduce (fn [acc f]
-                                         (if (.exists (io/file f))
-                                           (assoc acc f {:content (slurp f)
-                                                         :lines (str/split-lines (slurp f))
-                                                         :touched (get-user-touched-lines f)})
-                                           acc))
-                                       {}
-                                       files)]
+(defn cached-files-clean? [cached? files]
+  (let [unstaged-files (if cached?
+                         (filterv #(not (zero? (:exit (sh "git" "diff" "--quiet" "--" %)))) files)
+                         [])]
+    (doseq [file unstaged-files]
+      (println "Error: cached file also has unstaged changes:" file))
+    (empty? unstaged-files)))
 
-            ;; Run Transformer
-            (println "Running transformer...")
-            (let [{:keys [exit _ err]} (sh "bash" "-c" transformer-cmd)]
-              (if (not (zero? exit))
-                (println "Transformer warning/error:" err)
-                (println "Transformer finished.")))
+(defn parse-cli [raw-args]
+  (loop [args raw-args
+         cached? false
+         append-files? false
+         included-files []]
+    (cond
+      (= "--cached" (first args))
+      (recur (rest args) true append-files? included-files)
 
-            ;; Reconcile
-            (doseq [f files]
-              (when (contains? file-snapshots f)
-                (let [original-content (get-in file-snapshots [f :content])
-                      original-lines (get-in file-snapshots [f :lines])
-                      touched-set (get-in file-snapshots [f :touched])
-                      current-content (slurp f)]
+      (= "--append-files" (first args))
+      (recur (rest args) cached? true included-files)
 
-                  (if (= original-content current-content)
-                    (println "No changes by transformer for" f)
-                    (do
-                      (let [patch-out (generate-patch-hunks original-content current-content)]
-                        (if (str/blank? patch-out)
-                          (println "No effective patch for" f)
-                          (do
-                            (let [final-lines (parse-and-apply-hunks original-lines patch-out touched-set)
-                                  final-content (str/join "\n" final-lines)]
-                              (spit f (str final-content "\n"))
-                              (println "Applied partial formatting to" f))))))))))))))))
+      (= "--file" (first args))
+      (if-let [file (second args)]
+        (recur (nnext args) cached? append-files? (conj included-files file))
+        {:error "--file requires a path"})
 
-(-main (or *command-line-args* []))
+      :else
+      {:cached? cached?
+       :append-files? append-files?
+       :included-files included-files
+       :transformer-args (vec args)})))
+
+(defn -main [& raw-args]
+  (let [{:keys [cached? append-files? included-files transformer-args error]} (parse-cli raw-args)]
+    (cond
+      error
+      (do
+        (println "Error:" error)
+        1)
+
+      (empty? transformer-args)
+      (do
+        (println "Usage: onlydiff [--cached] [--append-files] [--file <path>]... <command> [args...]")
+        1)
+
+      :else
+      (do
+        (println "Transformer:" (pr-str transformer-args))
+        (let [files (get-changed-files cached? included-files)]
+          (cond
+            (empty? files)
+            (do
+              (println "No changed files detected in git.")
+              0)
+
+            (not (cached-files-clean? cached? files))
+            1
+
+            :else
+            (do
+              (println "Detected modified files:" files)
+
+              ;; Snapshot
+              (let [file-snapshots (reduce (fn [acc f]
+                                             (if (.exists (io/file f))
+                                               (assoc acc f {:content (slurp f)
+                                                             :lines (str/split-lines (slurp f))
+                                                             :touched (get-user-touched-lines cached? f)})
+                                               acc))
+                                           {}
+                                           files)]
+
+                ;; Run Transformer
+                (println "Running transformer...")
+                (let [command-args (if append-files?
+                                     (into transformer-args files)
+                                     transformer-args)
+                      {:keys [exit out err]} (apply sh command-args)]
+                  (when-not (str/blank? out)
+                    (print out))
+                  (if (zero? exit)
+                    (println "Transformer finished.")
+                    (println "Transformer warning/error:" err))
+
+                  ;; Reconcile
+                  (reconcile-files files file-snapshots)
+                  exit)))))))))
+
+(System/exit (apply -main *command-line-args*))

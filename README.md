@@ -11,12 +11,21 @@ Stop creating massive formatting diffs. Format only the lines you actually chang
 ## Usage
 
 ```bash
-onlydiff <command> [args...]
+onlydiff [--cached] [--append-files] [--file <path>]... <command> [args...]
 
-# Examples
+# Format working-tree changes
 onlydiff black myfile.py
 onlydiff prettier --write src/
 onlydiff gofmt -w .
+
+# Format staged changes, including an initial commit
+onlydiff --cached black myfile.py
+
+# Append all changed text files to a formatter command
+onlydiff --cached --append-files black
+
+# Restrict reconciliation to selected changed files
+onlydiff --cached --file myfile.py black myfile.py
 ```
 
 ## How It Works
@@ -35,11 +44,17 @@ onlydiff gofmt -w .
 
 ### High-level workflow
 1. Determine which files are changed:
-   - Runs `git diff --name-only HEAD` to list changed files.
+   - By default, runs `git diff --name-only HEAD`.
+   - With `--cached`, runs `git diff --cached --name-only HEAD`, or compares the index to an empty tree before the first commit.
+   - Cached mode rejects selected files that also have unstaged changes, keeping line ranges and file content in one coordinate system.
+   - Deleted, Git-classified binary, symbolic-link, and non-regular paths are skipped automatically.
+   - Repeat `--file <path>` to restrict snapshotting and reconciliation to selected changed files.
 2. Capture which lines the user changed:
-   - For each file, runs `git diff -U0 HEAD -- <file>` and parses the diff hunks to get the set of "user-touched" line numbers (the `+new,cnt` ranges).
+   - For each file, runs the corresponding zero-context diff and parses the hunks to get the set of "user-touched" line numbers (the `+new,cnt` ranges).
 3. Run the transformer:
-   - Runs the given transformer command (e.g. `black`, `prettier`) over the repo/files.
+   - Executes the provided command and arguments directly, preserving argument boundaries and filenames containing spaces.
+   - With `--append-files`, appends the selected text-file paths to the transformer arguments.
+   - Reconciles formatter output even when the transformer exits non-zero, then returns the transformer's exit status.
 4. Generate a patch between original and transformed file:
    - Writes original and transformed content to temporary files and runs `diff -U0 old new` to produce a unified diff with zero context.
 5. Parse the formatter diff and filter hunks:
@@ -73,4 +88,4 @@ onlydiff gofmt -w .
 ## Requirements
 
 - [Babashka](https://github.com/babashka/babashka)
-- Git repository with unstaged changes
+- Git repository with working-tree changes, or staged changes when using `--cached`
